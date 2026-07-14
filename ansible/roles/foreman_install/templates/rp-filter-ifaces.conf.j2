@@ -1,0 +1,1 @@
+{{ _rp_filter_ifaces | map('regex_replace', '^', 'net.ipv4.conf.') | map('regex_replace', '$', '.rp_filter = 0') | list | join('\n') }}

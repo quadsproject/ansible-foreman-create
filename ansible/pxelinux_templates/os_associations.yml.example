@@ -1,0 +1,28 @@
+# Map PXELinux template names to OS titles as they appear in Foreman.
+# Copy this file to os_associations.yml and update the values.
+#
+# Run on the Foreman host to see exact OS titles:
+#   hammer os list
+#
+# Each key is the exact filename (= Foreman name) of a PXELinux template
+# in this directory. Each value is a list of OS titles to associate.
+# Missing templates or OS titles produce a warning and are skipped.
+
+My PXELinux Template:
+  - "Red Hat Enterprise Linux 9.4"
+  - "Rocky Linux 9.1"
+
+# OS_Defaults — optional section.
+# Sets the default "PXELinux" template for an OS (the template Foreman uses
+# when PXE-booting a new host with that OS and no per-host override is set).
+#
+# Each key is an OS title exactly as shown by: hammer os list
+# The template value must be a template that is already associated with that OS
+# (either listed above or previously associated). If the template is not
+# associated with the OS a warning is printed and the default is not set.
+
+OS_Defaults:
+  "Red Hat Enterprise Linux 9.4":
+    template: "My PXELinux Template"
+  "Rocky Linux 9.1":
+    template: "My PXELinux Template"

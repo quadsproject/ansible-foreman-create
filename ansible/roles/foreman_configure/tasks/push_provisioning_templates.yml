@@ -1,0 +1,299 @@
+# Called via include_tasks with tpl_type dict:
+#   tpl_type.dir  - subdirectory under playbook_dir (e.g. provisioning_templates)
+#   tpl_type.kind - Foreman template kind (provision, PXELinux, PXEGrub2, snippet, ...)
+
+- name: "Find {{ tpl_type.kind }} files on the controller"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/{{ tpl_type.dir }}"
+    file_type: file
+    excludes:
+      - "*.yml"
+      - "*.example"
+    hidden: false
+  delegate_to: localhost
+  become: false
+  register: _tpl_files
+  failed_when: false
+
+- name: "Push {{ tpl_type.kind }} templates to Foreman"
+  theforeman.foreman.provisioning_template:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ item | basename }}"
+    template: "{{ lookup('file', item) }}"
+    kind: "{{ tpl_type.kind }}"
+    state: present
+  loop: "{{ _tpl_files.files | default([]) | map(attribute='path') | sort | list }}"
+
+- name: "Check for {{ tpl_type.kind }} OS association file"
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/{{ tpl_type.dir }}/os_associations.yml"
+  delegate_to: localhost
+  become: false
+  register: _tpl_assoc_stat
+
+- name: "Apply {{ tpl_type.kind }} template OS associations via Foreman API"
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import os, json, base64, ssl, sys
+    import urllib.request, urllib.parse, urllib.error
+
+    url_base = os.environ['FOREMAN_URL'] + '/api/v2'
+    auth = base64.b64encode(
+        (os.environ['FOREMAN_USER'] + ':' + os.environ['FOREMAN_PASS']).encode()
+    ).decode()
+    data = json.loads(os.environ['TPL_ASSOC'])
+    tpl_kind = os.environ.get('TPL_KIND', '')
+
+    ctx = ssl.create_default_context()
+    if os.environ.get('SSL_VERIFY', 'true') == 'false':
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {
+        'Authorization': 'Basic ' + auth,
+        'Content-Type': 'application/json',
+    }
+
+    def api_get(path):
+        req = urllib.request.Request(url_base + path, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.loads(r.read())
+
+    def api_put(path, payload):
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(url_base + path, data=body, method='PUT', headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.loads(r.read())
+
+    def api_post(path, payload):
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(url_base + path, data=body, method='POST', headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.loads(r.read())
+
+    # Separate the OS_Defaults section from the template->OS associations.
+    os_defaults = data.pop('OS_Defaults', None) or {}
+    associations = data
+
+    # Build OS title->id map using API-provided title (with constructed fallback).
+    os_list = api_get('/operatingsystems?per_page=1000').get('results', [])
+    os_by_title = {}
+    for o in os_list:
+        title = o.get('title')
+        if not title:
+            ver = '{}.{}'.format(o['major'], o['minor']) if o.get('minor') else o['major']
+            title = '{} {}'.format(o['name'], ver)
+        os_by_title[title] = o['id']
+
+    # Build template name->id map via client-side lookup (avoids search API quirks).
+    tpl_list = api_get('/provisioning_templates?per_page=1000').get('results', [])
+    tpl_by_name = {t['name']: t['id'] for t in tpl_list}
+
+    # Track the effective OS ID set for each template after this run (for OS_Defaults checks).
+    tpl_to_final_os_ids = {}
+
+    changed = False
+    for tpl_name, os_names in associations.items():
+        if tpl_name not in tpl_by_name:
+            print('WARNING: template {!r} not found in Foreman, skipping'.format(tpl_name))
+            continue
+        tpl_id = tpl_by_name[tpl_name]
+        # Fetch the show endpoint for the full record including operatingsystems.
+        full_tpl = api_get('/provisioning_templates/{}'.format(tpl_id))
+        current_os_ids = {o['id'] for o in full_tpl.get('operatingsystems', [])}
+        desired_os_ids = set(current_os_ids)
+
+        for os_name in os_names:
+            if os_name not in os_by_title:
+                print('WARNING: OS {!r} not found in Foreman, skipping'.format(os_name))
+                continue
+            desired_os_ids.add(os_by_title[os_name])
+
+        tpl_to_final_os_ids[tpl_id] = desired_os_ids
+
+        if desired_os_ids != current_os_ids:
+            api_put('/provisioning_templates/{}'.format(tpl_id),
+                    {'provisioning_template': {'operatingsystem_ids': list(desired_os_ids)}})
+            print('CHANGED: {!r} associated with {} OS(es)'.format(
+                tpl_name, len(desired_os_ids)))
+            changed = True
+        else:
+            print('OK: {!r} OS associations unchanged'.format(tpl_name))
+
+    if os_defaults and tpl_kind:
+        kinds_result = api_get('/template_kinds').get('results', [])
+        kind_by_name = {k['name']: k['id'] for k in kinds_result}
+        kind_id = kind_by_name.get(tpl_kind)
+        if not kind_id:
+            print('WARNING: template kind {!r} not found, skipping OS_Defaults'.format(tpl_kind))
+        else:
+            for os_title, default_info in os_defaults.items():
+                if not isinstance(default_info, dict):
+                    print('WARNING: OS_Defaults[{!r}] must be a mapping, skipping'.format(os_title))
+                    continue
+                tpl_name = default_info.get('template')
+                if not tpl_name:
+                    print('WARNING: OS_Defaults[{!r}] has no template key, skipping'.format(os_title))
+                    continue
+                if os_title not in os_by_title:
+                    print('WARNING: OS {!r} not defined in Foreman, skipping default'.format(os_title))
+                    continue
+                os_id = os_by_title[os_title]
+                if tpl_name not in tpl_by_name:
+                    print('WARNING: template {!r} not found in Foreman, skipping default for {!r}'.format(
+                        tpl_name, os_title))
+                    continue
+                tpl_id = tpl_by_name[tpl_name]
+                # Verify the template is associated with the OS before setting it as default.
+                final_ids = tpl_to_final_os_ids.get(tpl_id)
+                if final_ids is not None:
+                    associated = os_id in final_ids
+                else:
+                    full_tpl = api_get('/provisioning_templates/{}'.format(tpl_id))
+                    associated = os_id in {o['id'] for o in full_tpl.get('operatingsystems', [])}
+                if not associated:
+                    print('WARNING: {!r} is not associated with OS {!r}, skipping default'.format(
+                        tpl_name, os_title))
+                    continue
+                existing_defaults = api_get(
+                    '/operatingsystems/{}/os_default_templates'.format(os_id)
+                ).get('results', [])
+                existing = next(
+                    (d for d in existing_defaults if d.get('template_kind_id') == kind_id), None
+                )
+                if existing:
+                    if existing.get('provisioning_template_id') == tpl_id:
+                        print('OK: OS {!r} default {!r} template unchanged'.format(os_title, tpl_kind))
+                    else:
+                        api_put(
+                            '/operatingsystems/{}/os_default_templates/{}'.format(
+                                os_id, existing['id']),
+                            {'os_default_template': {'provisioning_template_id': tpl_id}}
+                        )
+                        print('CHANGED: OS {!r} default {!r} template set to {!r}'.format(
+                            os_title, tpl_kind, tpl_name))
+                        changed = True
+                else:
+                    api_post(
+                        '/operatingsystems/{}/os_default_templates'.format(os_id),
+                        {'os_default_template': {
+                            'template_kind_id': kind_id,
+                            'provisioning_template_id': tpl_id,
+                        }}
+                    )
+                    print('CHANGED: OS {!r} default {!r} template set to {!r}'.format(
+                        os_title, tpl_kind, tpl_name))
+                    changed = True
+
+    sys.exit(0)
+    PYEOF
+  environment:
+    FOREMAN_URL: "{{ foreman_url }}"
+    FOREMAN_USER: "{{ foreman_admin_username }}"
+    FOREMAN_PASS: "{{ foreman_admin_password }}"
+    SSL_VERIFY: "{{ foreman_validate_certs | string | lower }}"
+    TPL_KIND: "{{ tpl_type.kind }}"
+    TPL_ASSOC: "{{ lookup('file', playbook_dir + '/' + tpl_type.dir + '/os_associations.yml') | from_yaml | to_json }}"
+  register: _tpl_assoc_result
+  changed_when: "'CHANGED:' in _tpl_assoc_result.stdout"
+  when: _tpl_assoc_stat.stat.exists
+
+- name: "Show {{ tpl_type.kind }} OS association output"
+  ansible.builtin.debug:
+    msg: "{{ _tpl_assoc_result.stdout_lines }}"
+  when:
+    - _tpl_assoc_stat.stat.exists
+    - _tpl_assoc_result is not skipped
+
+# --- Local boot global setting (PXELinux / PXEGrub2 only) ---
+
+- name: "Check for {{ tpl_type.kind }} local-boot.yml setting file"
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/{{ tpl_type.dir }}/local-boot.yml"
+  delegate_to: localhost
+  become: false
+  register: _local_boot_stat
+  when: tpl_type.kind in ['PXELinux', 'PXEGrub2']
+
+- name: "Apply {{ tpl_type.kind }} local boot global setting"
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import os, json, base64, ssl, sys
+    import urllib.request, urllib.parse, urllib.error
+
+    url_base = os.environ['FOREMAN_URL'] + '/api/v2'
+    auth = base64.b64encode(
+        (os.environ['FOREMAN_USER'] + ':' + os.environ['FOREMAN_PASS']).encode()
+    ).decode()
+    template_name = os.environ['TPL_NAME']
+    setting_name  = os.environ['SETTING_NAME']
+    kind          = os.environ['TPL_KIND']
+
+    ctx = ssl.create_default_context()
+    if os.environ.get('SSL_VERIFY', 'true') == 'false':
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {'Authorization': 'Basic ' + auth, 'Content-Type': 'application/json'}
+
+    def api_req(method, path, data=None):
+        body = json.dumps(data).encode() if data is not None else None
+        req = urllib.request.Request(url_base + path, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=ctx) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+
+    # Verify the named template exists and has the expected kind
+    q = urllib.parse.urlencode({'search': 'name = "{}"'.format(template_name)})
+    tpl_result = api_req('GET', '/provisioning_templates?' + q)
+    if not tpl_result or not tpl_result.get('results'):
+        print('WARNING: no template named {!r} found in Foreman; '
+              'skipping local boot setting'.format(template_name))
+        sys.exit(0)
+
+    tpl = tpl_result['results'][0]
+    actual_kind = tpl.get('template_kind_name', '')
+    if actual_kind != kind:
+        print('WARNING: template {!r} has kind {!r}, expected {!r}; '
+              'skipping local boot setting'.format(template_name, actual_kind, kind))
+        sys.exit(0)
+
+    # Read the current global setting value
+    setting = api_req('GET', '/settings/{}'.format(setting_name))
+    if setting is None:
+        print('WARNING: Foreman setting {!r} not found; '
+              'check the setting name'.format(setting_name))
+        sys.exit(0)
+
+    current_value = setting.get('value', '')
+    if current_value == template_name:
+        print('OK: {} already set to {!r}'.format(setting_name, template_name))
+        sys.exit(0)
+
+    api_req('PUT', '/settings/{}'.format(setting_name),
+            {'setting': {'value': template_name}})
+    print('CHANGED: {} set to {!r} (was {!r})'.format(
+        setting_name, template_name, current_value))
+    sys.exit(0)
+    PYEOF
+  environment:
+    FOREMAN_URL: "{{ foreman_url }}"
+    FOREMAN_USER: "{{ foreman_admin_username }}"
+    FOREMAN_PASS: "{{ foreman_admin_password }}"
+    SSL_VERIFY: "{{ foreman_validate_certs | string | lower }}"
+    TPL_NAME: "{{ (lookup('file', playbook_dir + '/' + tpl_type.dir + '/local-boot.yml') | from_yaml).template }}"
+    SETTING_NAME: "local_boot_{{ tpl_type.kind }}"
+    TPL_KIND: "{{ tpl_type.kind }}"
+  register: _local_boot_result
+  changed_when: "'CHANGED:' in _local_boot_result.stdout"
+  when:
+    - tpl_type.kind in ['PXELinux', 'PXEGrub2']
+    - _local_boot_stat is not skipped
+    - _local_boot_stat.stat.exists

@@ -1,0 +1,26 @@
+# Python venv - not portable, recreate with: python3 -m venv venv && pip install ansible-core
+venv/
+__pycache__/
+*.pyc
+
+# Custom templates - drop-in files, not part of the project.
+# Each directory holds content files (no extension, filename = Foreman name)
+# and an optional os_associations.yml for OS mappings.
+ansible/partition_tables/*
+!ansible/partition_tables/.gitkeep
+!ansible/partition_tables/*.example
+ansible/provisioning_templates/*
+!ansible/provisioning_templates/.gitkeep
+!ansible/provisioning_templates/*.example
+ansible/pxelinux_templates/*
+!ansible/pxelinux_templates/.gitkeep
+!ansible/pxelinux_templates/*.example
+ansible/pxegrub2_templates/*
+!ansible/pxegrub2_templates/.gitkeep
+!ansible/pxegrub2_templates/*.example
+ansible/snippets/*
+!ansible/snippets/.gitkeep
+!ansible/snippets/*.example
+
+# Hostgroup definitions — may contain sensitive data (root passwords)
+ansible/hostgroups.yml

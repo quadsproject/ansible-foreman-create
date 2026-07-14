@@ -1,0 +1,431 @@
+---
+- name: Read Foreman admin password from remote hammer config (when not set by foreman_install)
+  ansible.builtin.shell: |
+    python3 -c "
+    import re, sys
+    content = open('/root/.hammer/cli.modules.d/foreman.yml').read()
+    m = re.search(r\":password:\\s+'([^']+)'\", content)
+    if m:
+        print(m.group(1))
+    else:
+        sys.exit(1)
+    "
+  register: _password_from_hammer
+  changed_when: false
+  when: foreman_admin_password is not defined
+
+- name: Set admin password fact from hammer config
+  ansible.builtin.set_fact:
+    foreman_admin_password: "{{ _password_from_hammer.stdout | trim }}"
+  when: foreman_admin_password is not defined
+
+- name: Install Python packages required by theforeman.foreman collection
+  ansible.builtin.dnf:
+    name:
+      - python3-apypie
+      - python3-pyyaml
+    state: present
+
+- name: Wait for Foreman API to become ready
+  ansible.builtin.uri:
+    url: "{{ foreman_url }}/api/v2/status"
+    validate_certs: "{{ foreman_validate_certs }}"
+    user: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    force_basic_auth: true
+    status_code: 200
+  register: api_status
+  retries: 20
+  delay: 15
+  until: api_status.status == 200
+
+# --- Global settings ---
+
+- name: Disable safemode rendering (Provisioning > Safemode rendering)
+  theforeman.foreman.setting:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: safemode_render
+    value: false
+
+# --- Domain and subnet ---
+
+- name: Create DNS domain
+  theforeman.foreman.domain:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ dns_domain }}"
+    dns_proxy: "{{ foreman_fqdn }}"
+    state: present
+
+- name: Create subnet
+  theforeman.foreman.subnet:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ subnet_cidr }}"
+    network: "{{ subnet_network }}"
+    mask: "{{ subnet_mask }}"
+    gateway: "{{ subnet_gateway }}"
+    dns_primary: "{{ subnet_primary_dns }}"
+    dns_secondary: "{{ subnet_secondary_dns | default(omit) }}"
+    from_ip: "{{ dhcp_range_start }}"
+    to_ip: "{{ dhcp_range_end }}"
+    domains:
+      - "{{ dns_domain }}"
+    dns_proxy: "{{ foreman_fqdn }}"
+    dhcp_proxy: "{{ foreman_fqdn }}"
+    tftp_proxy: "{{ foreman_fqdn }}"
+    state: present
+
+- name: Find Red Hat family distro variants mounted under /srv/distro
+  ansible.builtin.find:
+    paths: /srv/distro
+    file_type: directory
+    recurse: false
+  register: distro_dirs_result
+  failed_when: false
+
+- name: Set installation media variants list
+  ansible.builtin.set_fact:
+    install_media_variants: >-
+      {{ (distro_dirs_result.files | default([]))
+         | map(attribute='path')
+         | map('basename')
+         | select('in', ['Fedora', 'RHEL', 'Rocky'])
+         | list }}
+
+- name: Create local installation media in Foreman for Red Hat family distros
+  theforeman.foreman.installation_medium:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ item }} Local"
+    path: "http://{{ foreman_fqdn }}:8080/distro/{{ item }}/$version/$arch"
+    os_family: Redhat
+    state: present
+  loop: "{{ install_media_variants }}"
+
+# --- Define operating systems from mounted ISOs ---
+
+- name: Discover Red Hat family OS versions from mounted ISOs
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import json, subprocess
+
+    proc = subprocess.run(
+        ['findmnt', '-t', 'iso9660', '-n', '-l', '-o', 'TARGET'],
+        capture_output=True, text=True
+    )
+
+    os_map = {}
+    for line in proc.stdout.strip().splitlines():
+        line = line.strip()
+        if not line.startswith('/srv/distro/'):
+            continue
+        parts = line.split('/')
+        # Expect /srv/distro/<variant>/<version>/<arch> — exactly 6 parts
+        if len(parts) != 6:
+            continue
+        _, _, _, variant, version, arch = parts
+        if variant not in ('RHEL', 'Fedora', 'Rocky'):
+            continue
+
+        version_parts = version.split('.')
+        major = version_parts[0]
+        # Fedora has no minor version; RHEL and Rocky do
+        minor = '' if variant == 'Fedora' else (version_parts[1] if len(version_parts) > 1 else '')
+
+        key = (variant, major, minor)
+        if key not in os_map:
+            os_map[key] = {
+                'name':          variant,
+                'major':         major,
+                'minor':         minor,
+                'family':        'Redhat',
+                'media':         variant + ' Local',
+                'architectures': [],
+            }
+        if arch not in os_map[key]['architectures']:
+            os_map[key]['architectures'].append(arch)
+
+    print(json.dumps(list(os_map.values())))
+    PYEOF
+  register: _os_discovery
+  changed_when: false
+
+- name: Set discovered OS list fact
+  ansible.builtin.set_fact:
+    _foreman_os_list: "{{ _os_discovery.stdout | from_json }}"
+
+- name: Define Red Hat family operating systems in Foreman
+  theforeman.foreman.operatingsystem:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ item.name }}"
+    major: "{{ item.major }}"
+    minor: "{{ item.minor }}"
+    family: "{{ item.family }}"
+    architectures: "{{ item.architectures }}"
+    media:
+      - "{{ item.media }}"
+    state: present
+  loop: "{{ _foreman_os_list }}"
+  loop_control:
+    label: "{{ item.name }} {{ [item.major, item.minor] | select | join('.') }} ({{ item.architectures | join(', ') }})"
+
+# --- Custom partition tables (drop-in: ansible/partition_tables/) ---
+
+- name: Find custom partition table files on the controller
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/partition_tables"
+    file_type: file
+    excludes:
+      - "*.yml"
+      - "*.example"
+    hidden: false
+  delegate_to: localhost
+  become: false
+  register: ptable_files
+  failed_when: false
+
+- name: Push custom partition tables to Foreman
+  theforeman.foreman.partition_table:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ item | basename }}"
+    layout: "{{ lookup('file', item) }}"
+    os_family: Redhat
+    state: present
+  loop: "{{ ptable_files.files | default([]) | map(attribute='path') | sort | list }}"
+
+- name: Check for partition table OS association file on the controller
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/partition_tables/os_associations.yml"
+  delegate_to: localhost
+  become: false
+  register: ptable_assoc_stat
+
+- name: Apply partition table OS associations via Foreman API
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import os, json, base64, ssl, sys
+    import urllib.request, urllib.parse, urllib.error
+
+    url_base = os.environ['FOREMAN_URL'] + '/api/v2'
+    auth = base64.b64encode(
+        (os.environ['FOREMAN_USER'] + ':' + os.environ['FOREMAN_PASS']).encode()
+    ).decode()
+    associations = json.loads(os.environ['PTABLE_ASSOC'])
+
+    ctx = ssl.create_default_context()
+    if os.environ.get('SSL_VERIFY', 'true') == 'false':
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {
+        'Authorization': 'Basic ' + auth,
+        'Content-Type': 'application/json',
+    }
+
+    def api_get(path):
+        req = urllib.request.Request(url_base + path, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.loads(r.read())
+
+    def api_put(path, data):
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(url_base + path, data=body, method='PUT', headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.loads(r.read())
+
+    # Build OS title->id map using API-provided title (with constructed fallback).
+    os_list = api_get('/operatingsystems?per_page=1000').get('results', [])
+    os_by_title = {}
+    for o in os_list:
+        title = o.get('title')
+        if not title:
+            ver = '{}.{}'.format(o['major'], o['minor']) if o.get('minor') else o['major']
+            title = '{} {}'.format(o['name'], ver)
+        os_by_title[title] = o['id']
+
+    # Build partition table name->id map via client-side lookup.
+    ptable_list = api_get('/ptables?per_page=1000').get('results', [])
+    ptable_by_name = {t['name']: t['id'] for t in ptable_list}
+
+    changed = False
+    for ptable_name, os_names in associations.items():
+        if ptable_name not in ptable_by_name:
+            print('WARNING: partition table {!r} not found, skipping'.format(ptable_name))
+            continue
+        ptable_id = ptable_by_name[ptable_name]
+        # Fetch the show endpoint for the full record including operatingsystems.
+        full_ptable = api_get('/ptables/{}'.format(ptable_id))
+        current_os_ids = {o['id'] for o in full_ptable.get('operatingsystems', [])}
+        desired_os_ids = set(current_os_ids)
+
+        for os_name in os_names:
+            if os_name not in os_by_title:
+                print('WARNING: OS {!r} not found in Foreman, skipping'.format(os_name))
+                continue
+            desired_os_ids.add(os_by_title[os_name])
+
+        if desired_os_ids != current_os_ids:
+            api_put('/ptables/{}'.format(ptable_id),
+                    {'ptable': {'operatingsystem_ids': list(desired_os_ids)}})
+            print('CHANGED: {!r} associated with {} OS(es)'.format(
+                ptable_name, len(desired_os_ids)))
+            changed = True
+        else:
+            print('OK: {!r} OS associations unchanged'.format(ptable_name))
+
+    sys.exit(0)
+    PYEOF
+  environment:
+    FOREMAN_URL: "{{ foreman_url }}"
+    FOREMAN_USER: "{{ foreman_admin_username }}"
+    FOREMAN_PASS: "{{ foreman_admin_password }}"
+    SSL_VERIFY: "{{ foreman_validate_certs | string | lower }}"
+    PTABLE_ASSOC: "{{ lookup('file', playbook_dir + '/partition_tables/os_associations.yml') | from_yaml | to_json }}"
+  register: ptable_assoc_result
+  changed_when: "'CHANGED:' in ptable_assoc_result.stdout"
+  when: ptable_assoc_stat.stat.exists
+
+- name: Show partition table OS association output
+  ansible.builtin.debug:
+    msg: "{{ ptable_assoc_result.stdout_lines }}"
+  when:
+    - ptable_assoc_stat.stat.exists
+    - ptable_assoc_result is not skipped
+
+# --- Custom provisioning templates (drop-in directories) ---
+
+- name: Push custom provisioning templates of all kinds
+  ansible.builtin.include_tasks: push_provisioning_templates.yml
+  loop:
+    - {dir: provisioning_templates, kind: provision}
+    - {dir: pxelinux_templates,     kind: PXELinux}
+    - {dir: pxegrub2_templates,     kind: PXEGrub2}
+    - {dir: snippets,               kind: snippet}
+  loop_control:
+    loop_var: tpl_type
+
+# --- Hostgroups ---
+
+- name: Check for hostgroups definition file
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/hostgroups.yml"
+  delegate_to: localhost
+  become: false
+  register: _hostgroups_stat
+
+- name: Load hostgroup definitions
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/hostgroups.yml"
+  when: _hostgroups_stat.stat.exists
+
+- name: Validate hostgroup parent references against Foreman
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import os, json, base64, ssl, sys
+    import urllib.request
+
+    url_base = os.environ['FOREMAN_URL'] + '/api/v2'
+    auth = base64.b64encode(
+        (os.environ['FOREMAN_USER'] + ':' + os.environ['FOREMAN_PASS']).encode()
+    ).decode()
+    foreman_hostgroups = json.loads(os.environ['HOSTGROUPS'])
+
+    ctx = ssl.create_default_context()
+    if os.environ.get('SSL_VERIFY', 'true') == 'false':
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {'Authorization': 'Basic ' + auth, 'Content-Type': 'application/json'}
+
+    def api_get(path):
+        req = urllib.request.Request(url_base + path, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.loads(r.read())
+
+    # Seed the will-exist set from the current hostgroup titles in Foreman.
+    hg_list = api_get('/hostgroups?per_page=1000').get('results', [])
+    will_exist = {hg['title'] for hg in hg_list}
+
+    # Process entries in order, adding each accepted entry to will_exist
+    # so that a parent defined earlier in the list satisfies later children.
+    valid = []
+    for hg in foreman_hostgroups:
+        name = hg['name']
+        parent = hg.get('parent')
+        if parent is None:
+            will_exist.add(name)
+            valid.append(hg)
+        elif parent in will_exist:
+            will_exist.add(parent + '/' + name)
+            valid.append(hg)
+        else:
+            print('WARNING: hostgroup {!r} skipped - parent {!r} not found in Foreman'.format(
+                name, parent), file=sys.stderr)
+
+    print(json.dumps(valid))
+    PYEOF
+  environment:
+    FOREMAN_URL: "{{ foreman_url }}"
+    FOREMAN_USER: "{{ foreman_admin_username }}"
+    FOREMAN_PASS: "{{ foreman_admin_password }}"
+    SSL_VERIFY: "{{ foreman_validate_certs | string | lower }}"
+    HOSTGROUPS: "{{ foreman_hostgroups | default([]) | to_json }}"
+  register: _hg_validation
+  changed_when: false
+  when: _hostgroups_stat.stat.exists
+
+- name: Show hostgroup parent validation warnings
+  ansible.builtin.debug:
+    msg: "{{ _hg_validation.stderr_lines }}"
+  when:
+    - _hostgroups_stat.stat.exists
+    - _hg_validation is not skipped
+    - _hg_validation.stderr_lines | length > 0
+
+- name: Set validated hostgroup list
+  ansible.builtin.set_fact:
+    _foreman_valid_hostgroups: "{{ _hg_validation.stdout | from_json }}"
+  when: _hostgroups_stat.stat.exists
+
+- name: Define hostgroups in Foreman
+  theforeman.foreman.hostgroup:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: "{{ item.name }}"
+    parent: "{{ item.parent | default(omit) }}"
+    description: "{{ item.description | default(omit) }}"
+    domain: "{{ item.domain | default(omit) }}"
+    subnet: "{{ item.subnet | default(omit) }}"
+    architecture: "{{ item.architecture | default(omit) }}"
+    operatingsystem: "{{ item.operatingsystem | default(omit) }}"
+    medium: "{{ item.medium | default(omit) }}"
+    ptable: "{{ item.ptable | default(omit) }}"
+    pxe_loader: "{{ item.pxe_loader | default(omit) }}"
+    root_pass: "{{ item.root_pass | default(omit) }}"
+    locations:
+      - "{{ foreman_default_location }}"
+    organizations:
+      - "{{ foreman_default_organization }}"
+    state: present
+  loop: "{{ _foreman_valid_hostgroups | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: _hostgroups_stat.stat.exists

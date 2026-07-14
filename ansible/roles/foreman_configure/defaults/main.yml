@@ -1,0 +1,6 @@
+---
+foreman_url: "https://{{ foreman_fqdn }}"
+foreman_admin_username: admin
+foreman_validate_certs: false
+foreman_default_organization: "Default Organization"
+foreman_default_location: "Default Location"

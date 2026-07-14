@@ -1,0 +1,13 @@
+---
+- name: Install and configure Foreman
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: foreman_firewall
+      tags: [foreman_firewall]
+    - role: foreman_install
+      tags: [foreman_install]
+    - role: foreman_distro
+      tags: [foreman_distro]
+    - role: foreman_configure
+      tags: [foreman_configure]

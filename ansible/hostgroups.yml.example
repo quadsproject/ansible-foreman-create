@@ -1,0 +1,71 @@
+# Foreman hostgroup definitions.
+# Copy this file to hostgroups.yml and edit to match your environment.
+#
+# This file is loaded with Ansible include_vars, so Ansible Vault-encrypted
+# strings are supported. Encrypt sensitive values with:
+#   ansible-vault encrypt_string 'secretvalue' --name root_pass
+#
+# IMPORTANT: list parent hostgroups before any children that reference them.
+# The playbook processes entries in order; a child whose parent does not yet
+# exist in Foreman will fail.
+#
+# All fields except "name" are optional. Omitted fields are left unset on the
+# hostgroup (inheriting from the parent when one is specified). This means a
+# child hostgroup only needs to list the fields it wants to override.
+#
+# Supported fields:
+#   name          (required) Foreman hostgroup name (leaf name only, not full path)
+#   parent        Full name of the parent hostgroup (top-level: omit entirely)
+#   description   Free-text description
+#   domain        DNS domain name, exactly as defined in Foreman
+#   subnet        IPv4 subnet name, exactly as defined in Foreman
+#   architecture  CPU architecture (e.g. x86_64)
+#   operatingsystem  OS title as shown by: hammer os list
+#   medium        Installation media name, exactly as defined in Foreman
+#   ptable        Partition table name, exactly as defined in Foreman
+#   pxe_loader    One of:
+#                   None
+#                   PXELinux BIOS
+#                   PXELinux UEFI
+#                   Grub UEFI
+#                   Grub2 UEFI
+#                   Grub2 UEFI SecureBoot
+#                   Grub2 ELF
+#                   iPXE Embedded
+#                   iPXE SAN Boot
+#   root_pass     Root password for provisioned hosts (can be vault-encrypted)
+#
+# All hostgroups are placed in the default organization and location
+# (controlled by foreman_default_organization and foreman_default_location
+# role variables; defaults: "Default Organization" / "Default Location").
+
+foreman_hostgroups:
+
+  # Top-level hostgroup: defines all common settings
+  - name: "RHEL BIOS"
+    description: "RHEL hosts provisioned via PXELinux BIOS"
+    domain: "subdomain.example.com"
+    subnet: "192.168.200.0/24"
+    architecture: "x86_64"
+    operatingsystem: "RHEL 9.4"
+    medium: "RHEL Local"
+    ptable: "My Partition Table"
+    pxe_loader: "PXELinux BIOS"
+    root_pass: "changeme"
+
+  # Child hostgroup: inherits all settings from parent, overrides only pxe_loader
+  - name: "RHEL UEFI"
+    parent: "RHEL BIOS"
+    pxe_loader: "Grub2 UEFI"
+
+  # Another top-level example with a different OS
+  - name: "Rocky BIOS"
+    description: "Rocky Linux hosts provisioned via PXELinux BIOS"
+    domain: "subdomain.example.com"
+    subnet: "192.168.200.0/24"
+    architecture: "x86_64"
+    operatingsystem: "Rocky 9.1"
+    medium: "Rocky Local"
+    ptable: "My Partition Table"
+    pxe_loader: "PXELinux BIOS"
+    root_pass: "changeme"
