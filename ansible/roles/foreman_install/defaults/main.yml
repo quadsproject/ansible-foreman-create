@@ -1,0 +1,13 @@
+---
+# Override foreman_version via extra-vars from ansible-foreman-create (dynamic lookup).
+# This fallback is used only when the releases page is unreachable.
+foreman_version: "3.13"
+
+puppet_release_rpm: "https://yum.puppet.com/puppet8-release-el-9.noarch.rpm"
+
+foreman_ssl_cert_dest: /etc/pki/tls/certs/foreman.crt
+foreman_ssl_key_dest: /etc/pki/tls/private/foreman.key
+foreman_ssl_ca_dest: /etc/pki/ca-trust/source/anchors/foreman-ssl-ca.crt
+
+hammer_config_dir: "{{ lookup('env', 'HOME') }}/.hammer/cli.modules.d"
+hammer_config_file: "{{ hammer_config_dir }}/foreman.yml"

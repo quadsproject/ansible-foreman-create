@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""ansible-foreman-create: automate Foreman installation on Rocky 9."""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+
+_FQDN_RE = re.compile(
+    r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+$"
+)
+
+
+def _prompt(message, default=None):
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{message}{suffix}: ").strip()
+    return value or default or ""
+
+
+def _abort(message):
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _validate_fqdn(value, label):
+    if not _FQDN_RE.match(value):
+        _abort(f"{label} '{value}' is not a valid fully qualified domain name")
+
+
+def _validate_subnet(value):
+    try:
+        ipaddress.ip_network(value, strict=False)
+    except ValueError as exc:
+        _abort(f"Invalid subnet '{value}': {exc}")
+
+
+def _validate_file(path, label):
+    if not Path(path).is_file():
+        _abort(f"{label} '{path}' does not exist or is not a file")
+
+
+def _check_ssh(host):
+    print(f"Verifying passwordless SSH to root@{host} ...")
+    result = subprocess.run(
+        [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            f"root@{host}",
+            "true",
+        ],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        _abort(
+            f"Cannot connect to root@{host} via SSH without a password.\n"
+            "       Ensure the host is reachable and passwordless SSH is "
+            "configured for root."
+        )
+    print("SSH connectivity verified.")
+
+
+def _latest_foreman_version():
+    url = "https://yum.theforeman.org/releases/"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            html = resp.read().decode()
+    except Exception as exc:
+        print(
+            f"Warning: could not fetch Foreman releases page: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    versions = re.findall(r'href="(\d+\.\d+)/"', html)
+    if not versions:
+        print(
+            "Warning: no version directories found on Foreman releases page.",
+            file=sys.stderr,
+        )
+        return None
+    return sorted(versions, key=lambda v: [int(x) for x in v.split(".")])[-1]
+
+
+_HAMMER_WRAPPER = """\
+#!/usr/bin/env bash
+# hammer - remote wrapper: SSHes to the Foreman host and runs hammer there.
+# Reads the Foreman host from ~/.hammer/cli.modules.d/foreman.yml at runtime.
+# Installed by foreman-auto-create; re-run it or copy this file to reinstall.
+FOREMAN_HOST=$(python3 << 'PYEOF'
+import re, os
+f = os.path.expanduser('~/.hammer/cli.modules.d/foreman.yml')
+c = open(f).read()
+m = re.search(r":host:\\s+'https?://([^/']+)/?'", c)
+print(m.group(1) if m else '')
+PYEOF
+)
+if [[ -z "$FOREMAN_HOST" ]]; then
+    echo "hammer: cannot determine Foreman host from ~/.hammer/cli.modules.d/foreman.yml" >&2
+    exit 1
+fi
+CMD="hammer"
+for arg in "$@"; do
+    CMD="$CMD $(printf '%q' "$arg")"
+done
+exec ssh -q -o BatchMode=yes root@"$FOREMAN_HOST" "$CMD"
+"""
+
+
+def _install_hammer_wrapper():
+    script_dir = Path(__file__).resolve().parent
+    venv_bin = script_dir / "venv" / "bin"
+    if not venv_bin.is_dir():
+        print(
+            "Note: venv/bin/ not found; skipping hammer wrapper installation.\n"
+            "      Create the venv and re-run foreman-auto-create to install it.",
+            file=sys.stderr,
+        )
+        return
+    wrapper = venv_bin / "hammer"
+    wrapper.write_text(_HAMMER_WRAPPER)
+    wrapper.chmod(0o755)
+    print(f"Installed hammer wrapper → {wrapper}")
+    print("  Activate the venv and run 'hammer host list' to verify.")
+
+
+def _find_ansible_playbook():
+    script_dir = Path(__file__).resolve().parent
+    venv_bin = script_dir / "venv" / "bin" / "ansible-playbook"
+    if venv_bin.is_file():
+        return str(venv_bin)
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / "ansible-playbook"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _run_playbook(host, extra_vars):
+    script_dir = Path(__file__).resolve().parent
+    playbook = script_dir / "ansible" / "site.yml"
+    if not playbook.is_file():
+        _abort(f"Playbook not found: {playbook}")
+
+    ansible_playbook = _find_ansible_playbook()
+    if not ansible_playbook:
+        _abort(
+            "ansible-playbook not found. "
+            "Set up the project venv: python3 -m venv venv && "
+            "source venv/bin/activate && pip install ansible-core"
+        )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".ini", delete=False) as fh:
+        fh.write(f"[foreman]\n{host} ansible_user=root\n")
+        inv_path = fh.name
+
+    try:
+        rc = subprocess.run(
+            [
+                ansible_playbook,
+                "-i", inv_path,
+                str(playbook),
+                "--extra-vars", json.dumps(extra_vars),
+            ]
+        ).returncode
+    finally:
+        os.unlink(inv_path)
+
+    return rc
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Automate Foreman installation and configuration on a Rocky 9 host.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--host", help="FQDN of the target host")
+    name_group = parser.add_mutually_exclusive_group()
+    name_group.add_argument(
+        "--new-name", help="New FQDN to assign to the host after installation"
+    )
+    name_group.add_argument(
+        "--no-new-name",
+        action="store_true",
+        help="Do not rename the host (skip name prompt)",
+    )
+    parser.add_argument(
+        "--dns",
+        help="Initial DNS domain for managed hosts (e.g. projectX.example.com)",
+    )
+    parser.add_argument(
+        "--subnet", help="Initial IPv4 subnet CIDR (e.g. 192.168.1.0/24)"
+    )
+    parser.add_argument(
+        "--subnet-gateway",
+        help="Gateway IP for the managed subnet (default: last usable host IP in subnet)",
+    )
+    parser.add_argument(
+        "--subnet-primary-dns",
+        help="Primary DNS server IP for the managed subnet (default: Foreman host IP on subnet)",
+    )
+    parser.add_argument(
+        "--subnet-secondary-dns",
+        help="Secondary DNS server IP for the managed subnet (default: none)",
+    )
+    parser.add_argument(
+        "--upstream-dns",
+        help="Comma-separated upstream DNS server IPs for forwarders (e.g. 8.8.8.8,1.1.1.1)",
+    )
+    parser.add_argument(
+        "--dhcp-interface",
+        help="Network interface on the Foreman host used for DHCP (e.g. eth1)",
+    )
+    parser.add_argument("--ssl-cert", help="Path to SSL certificate file")
+    parser.add_argument("--ssl-key", help="Path to SSL private key file")
+    args = parser.parse_args()
+
+    # --- Collect parameters ---
+
+    host = args.host or _prompt("Target host FQDN")
+    if not host:
+        _abort("Host FQDN is required")
+    _validate_fqdn(host, "Host FQDN")
+
+    if args.no_new_name:
+        new_fqdn = ""
+    elif args.new_name:
+        _validate_fqdn(args.new_name, "--new-name")
+        new_fqdn = "" if args.new_name == host else args.new_name
+    else:
+        entered = _prompt(
+            "New FQDN for the host (press Enter to keep current)",
+            default=host,
+        )
+        if not entered or entered == host:
+            new_fqdn = ""
+        else:
+            _validate_fqdn(entered, "New FQDN")
+            new_fqdn = entered
+
+    foreman_fqdn = new_fqdn if new_fqdn else host
+
+    dns_domain = args.dns or _prompt(
+        "DNS domain for managed hosts (e.g. projectX.example.com)"
+    )
+    if not dns_domain:
+        _abort("DNS domain is required")
+
+    subnet = args.subnet or _prompt("IPv4 subnet CIDR (e.g. 192.168.1.0/24)")
+    if not subnet:
+        _abort("Subnet CIDR is required")
+    _validate_subnet(subnet)
+
+    dhcp_interface = args.dhcp_interface or _prompt(
+        "Network interface on Foreman host for DHCP (e.g. eth1)"
+    )
+    if not dhcp_interface:
+        _abort("DHCP interface is required")
+
+    ssl_cert = args.ssl_cert or _prompt("Path to SSL certificate file")
+    if not ssl_cert:
+        _abort("SSL certificate path is required")
+    _validate_file(ssl_cert, "SSL certificate")
+
+    ssl_key = args.ssl_key or _prompt("Path to SSL private key file")
+    if not ssl_key:
+        _abort("SSL key path is required")
+    _validate_file(ssl_key, "SSL key")
+
+    upstream_dns_raw = args.upstream_dns or _prompt(
+        "Upstream DNS forwarder IPs (comma-separated, e.g. 8.8.8.8,1.1.1.1)"
+    )
+    if not upstream_dns_raw:
+        _abort("At least one upstream DNS server is required")
+    upstream_dns_servers = []
+    for _ip_str in upstream_dns_raw.split(","):
+        _ip_str = _ip_str.strip()
+        if not _ip_str:
+            continue
+        try:
+            ipaddress.ip_address(_ip_str)
+        except ValueError as exc:
+            _abort(f"Invalid upstream DNS IP '{_ip_str}': {exc}")
+        upstream_dns_servers.append(_ip_str)
+    if not upstream_dns_servers:
+        _abort("At least one valid upstream DNS server is required")
+
+    # --- Pre-flight ---
+
+    _check_ssh(host)
+
+    print("Determining latest stable Foreman version ...")
+    foreman_version = _latest_foreman_version()
+    if foreman_version:
+        print(f"Latest stable Foreman: {foreman_version}")
+    else:
+        print(
+            "Warning: falling back to version defined in playbook defaults.",
+            file=sys.stderr,
+        )
+
+    # --- Derive subnet components ---
+
+    network = ipaddress.ip_network(subnet, strict=False)
+
+    # Compute the reverse DNS zone from the managed subnet.
+    # Use 1 octet for /8, 2 for /9-/16, 3 for /17-/32.
+    prefix = network.prefixlen
+    octets = str(network.network_address).split(".")
+    n = 1 if prefix <= 8 else (2 if prefix <= 16 else 3)
+    dns_reverse_zone = ".".join(reversed(octets[:n])) + ".in-addr.arpa"
+
+    # Foreman host takes the first host IP on the managed subnet.
+    foreman_ip = network.network_address + 1
+
+    # Gateway: last usable host IP (broadcast - 1) unless overridden.
+    if args.subnet_gateway:
+        try:
+            gateway_ip = ipaddress.ip_address(args.subnet_gateway)
+        except ValueError as exc:
+            _abort(f"Invalid --subnet-gateway '{args.subnet_gateway}': {exc}")
+    else:
+        gateway_ip = network.broadcast_address - 1
+
+    # Primary DNS: Foreman host IP by default.
+    if args.subnet_primary_dns:
+        try:
+            ipaddress.ip_address(args.subnet_primary_dns)
+        except ValueError as exc:
+            _abort(f"Invalid --subnet-primary-dns '{args.subnet_primary_dns}': {exc}")
+        primary_dns = args.subnet_primary_dns
+    else:
+        primary_dns = str(foreman_ip)
+
+    # Secondary DNS: blank unless specified.
+    if args.subnet_secondary_dns:
+        try:
+            ipaddress.ip_address(args.subnet_secondary_dns)
+        except ValueError as exc:
+            _abort(f"Invalid --subnet-secondary-dns '{args.subnet_secondary_dns}': {exc}")
+        secondary_dns = args.subnet_secondary_dns
+    else:
+        secondary_dns = ""
+
+    # DHCP range: start one after the Foreman host IP, end one before the gateway.
+    dhcp_range_start = str(foreman_ip + 1)
+    dhcp_range_end = str(gateway_ip - 1)
+
+    # DNS servers for DHCP option 6 (domain-name-servers).
+    dhcp_dns_parts = [primary_dns]
+    if secondary_dns:
+        dhcp_dns_parts.append(secondary_dns)
+    dhcp_dns_servers = ", ".join(dhcp_dns_parts)
+
+    # --- Build Ansible extra vars ---
+
+    extra_vars = {
+        "foreman_fqdn": foreman_fqdn,
+        "new_fqdn": new_fqdn,
+        "dns_domain": dns_domain,
+        "subnet_cidr": subnet,
+        "subnet_network": str(network.network_address),
+        "subnet_mask": str(network.netmask),
+        "subnet_gateway": str(gateway_ip),
+        "subnet_primary_dns": primary_dns,
+        "dhcp_interface": dhcp_interface,
+        "dhcp_interface_ip": str(foreman_ip),
+        "dhcp_prefix": str(network.prefixlen),
+        "dhcp_range_start": dhcp_range_start,
+        "dhcp_range_end": dhcp_range_end,
+        "dhcp_dns_servers": dhcp_dns_servers,
+        "dns_reverse_zone": dns_reverse_zone,
+        "upstream_dns_servers": upstream_dns_servers,
+        "ssl_cert_src": str(Path(ssl_cert).resolve()),
+        "ssl_key_src": str(Path(ssl_key).resolve()),
+    }
+    if secondary_dns:
+        extra_vars["subnet_secondary_dns"] = secondary_dns
+    if foreman_version:
+        extra_vars["foreman_version"] = foreman_version
+
+    # --- Run ---
+
+    print("\nStarting Foreman installation via Ansible ...")
+    rc = _run_playbook(host, extra_vars)
+    if rc == 0:
+        _install_hammer_wrapper()
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

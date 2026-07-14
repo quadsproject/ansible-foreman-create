@@ -1,0 +1,316 @@
+---
+- name: Set new hostname
+  ansible.builtin.hostname:
+    name: "{{ new_fqdn }}"
+  when: new_fqdn != '' and new_fqdn != ansible_facts['fqdn']
+
+- name: Ensure new hostname in /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "127.0.0.1 {{ new_fqdn }} {{ new_fqdn.split('.')[0] }}"
+    state: present
+  when: new_fqdn != '' and new_fqdn != ansible_facts['fqdn']
+
+- name: Enable CRB repository
+  ansible.builtin.command: dnf config-manager --enable crb
+  changed_when: false
+
+- name: Install Puppet 8 release RPM
+  ansible.builtin.dnf:
+    name: "{{ puppet_release_rpm }}"
+    state: present
+    disable_gpg_check: true
+
+- name: Install Foreman release RPM
+  ansible.builtin.dnf:
+    name: "https://yum.theforeman.org/releases/{{ foreman_version }}/el9/x86_64/foreman-release.rpm"
+    state: present
+    disable_gpg_check: true
+
+- name: Install foreman-installer
+  ansible.builtin.dnf:
+    name: foreman-installer
+    state: present
+
+- name: Check current IP on DHCP interface
+  ansible.builtin.command:
+    cmd: "ip -br addr show {{ dhcp_interface }}"
+  register: iface_addr
+  changed_when: false
+
+- name: Configure static IP on DHCP interface
+  ansible.builtin.shell: |
+    set -e
+    if nmcli -g NAME con show | grep -qxF "{{ dhcp_interface }}"; then
+      nmcli con modify "{{ dhcp_interface }}" \
+        ipv4.addresses "{{ dhcp_interface_ip }}/{{ dhcp_prefix }}" \
+        ipv4.method static \
+        connection.autoconnect yes
+    else
+      nmcli con add \
+        type ethernet \
+        ifname "{{ dhcp_interface }}" \
+        con-name "{{ dhcp_interface }}" \
+        ipv4.addresses "{{ dhcp_interface_ip }}/{{ dhcp_prefix }}" \
+        ipv4.method static \
+        connection.autoconnect yes
+    fi
+    nmcli con up "{{ dhcp_interface }}"
+  when: dhcp_interface_ip not in iface_addr.stdout
+
+- name: Write sysctl settings
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-sysctl.conf
+    mode: "0644"
+    content: |
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+      #### tcp kernel tuning
+      net.core.rmem_max=8388608
+      net.core.wmem_max=8388608
+      net.core.rmem_default=65536
+      net.core.wmem_default=65536
+      net.core.somaxconn = 2048
+      ### turn off ipv6
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+  register: _sysctl_file
+  tags: [foreman_sysctl]
+
+- name: Find network interfaces with rp_filter support
+  ansible.builtin.find:
+    paths: /proc/sys/net/ipv4/conf
+    file_type: directory
+    recurse: false
+  register: _rp_filter_dirs
+  tags: [foreman_sysctl]
+
+- name: Set interface list for per-interface rp_filter settings
+  ansible.builtin.set_fact:
+    _rp_filter_ifaces: >-
+      {{ _rp_filter_dirs.files
+         | map(attribute='path') | map('basename')
+         | list | difference(['all', 'default', 'lo']) | sort }}
+  tags: [foreman_sysctl]
+
+- name: Write per-interface rp_filter sysctl settings
+  ansible.builtin.template:
+    src: rp-filter-ifaces.conf.j2
+    dest: /etc/sysctl.d/99-rp-filter-ifaces.conf
+    mode: "0644"
+  register: _rp_filter_iface_file
+  tags: [foreman_sysctl]
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  when: _sysctl_file is changed or _rp_filter_iface_file is changed
+  changed_when: true
+  tags: [foreman_sysctl]
+
+- name: Copy SSL certificate to host
+  ansible.builtin.copy:
+    src: "{{ ssl_cert_src }}"
+    dest: "{{ foreman_ssl_cert_dest }}"
+    mode: "0644"
+
+- name: Copy SSL private key to host
+  ansible.builtin.copy:
+    src: "{{ ssl_key_src }}"
+    dest: "{{ foreman_ssl_key_dest }}"
+    mode: "0600"
+
+- name: Extract CA chain from SSL certificate bundle
+  ansible.builtin.shell: |
+    python3 -c "
+    import re
+    content = open('{{ foreman_ssl_cert_dest }}').read()
+    certs = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', content, re.DOTALL)
+    if len(certs) > 1:
+        print('\n'.join(certs[1:]))
+    "
+  register: ca_chain
+  changed_when: false
+
+- name: Install CA chain in system trust store
+  ansible.builtin.copy:
+    content: "{{ ca_chain.stdout }}\n"
+    dest: /etc/pki/ca-trust/source/anchors/foreman-ssl-ca.crt
+    mode: "0644"
+  when: ca_chain.stdout | length > 0
+  register: ca_trust_updated
+
+- name: Update system CA trust
+  ansible.builtin.command: update-ca-trust
+  when: ca_trust_updated is changed
+  changed_when: true
+
+- name: Append CA chain to Puppet SSL bundle
+  ansible.builtin.shell: |
+    python3 -c "
+    import re
+    ca_content = open('/etc/pki/ca-trust/source/anchors/foreman-ssl-ca.crt').read()
+    puppet_bundle_file = '/opt/puppetlabs/puppet/ssl/cert.pem'
+    puppet_bundle = open(puppet_bundle_file).read()
+    certs = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', ca_content, re.DOTALL)
+    added = False
+    for cert in certs:
+        if cert not in puppet_bundle:
+            with open(puppet_bundle_file, 'a') as f:
+                f.write('\n' + cert + '\n')
+            added = True
+    print('changed' if added else 'unchanged')
+    "
+  register: puppet_ca_result
+  changed_when: "'changed' in puppet_ca_result.stdout"
+  when: ca_chain.stdout | length > 0
+
+- name: Run foreman-installer
+  ansible.builtin.command:
+    argv:
+      - foreman-installer
+      - --foreman-server-ssl-cert
+      - "{{ foreman_ssl_cert_dest }}"
+      - --foreman-server-ssl-key
+      - "{{ foreman_ssl_key_dest }}"
+      - --enable-foreman-proxy
+      - --foreman-proxy-dns
+      - "true"
+      - --foreman-proxy-dns-managed
+      - "true"
+      - --foreman-proxy-dns-zone
+      - "{{ dns_domain }}"
+      - --foreman-proxy-dns-reverse
+      - "{{ dns_reverse_zone }}"
+      - --foreman-proxy-dhcp
+      - "true"
+      - --foreman-proxy-dhcp-managed
+      - "true"
+      - --foreman-proxy-dhcp-interface
+      - "{{ dhcp_interface }}"
+      - --foreman-proxy-tftp
+      - "true"
+      - --foreman-proxy-tftp-managed
+      - "true"
+  register: foreman_installer_result
+  changed_when: "'Installation complete' in foreman_installer_result.stdout"
+
+- name: Remove stray dnssec-enable line from outside the managed block
+  ansible.builtin.lineinfile:
+    path: /etc/named/options.conf
+    regexp: '^\s+dnssec-enable\s'
+    state: absent
+  tags: [foreman_named]
+
+- name: Configure DNS forwarders and additional named options
+  ansible.builtin.blockinfile:
+    path: /etc/named/options.conf
+    marker: "# {mark} ANSIBLE MANAGED - DNS forwarders"
+    block: |
+      forwarders { {{ upstream_dns_servers | join('; ') }}; };
+      forward only;
+      dnssec-enable no;
+      filter-aaaa-on-v4 yes;
+      filter-aaaa-on-v6 yes;
+  register: _named_options
+  tags: [foreman_named]
+
+- name: Set named option values
+  ansible.builtin.lineinfile:
+    path: /etc/named/options.conf
+    regexp: "{{ item.regexp }}"
+    line: "\t{{ item.line }}"
+  loop:
+    - {regexp: '^\s*recursion\s',       line: 'recursion yes;'}
+    - {regexp: '^\s*dnssec-validation\s', line: 'dnssec-validation no;'}
+    - {regexp: '^\s*allow-query\s',     line: 'allow-query     { any; };'}
+    - {regexp: '^\s*allow-recursion\s', line: 'allow-recursion { any; };'}
+  register: _named_options_lines
+  tags: [foreman_named]
+
+- name: Restart named to apply options changes
+  ansible.builtin.service:
+    name: named
+    state: restarted
+  when: _named_options is changed or _named_options_lines is changed
+  tags: [foreman_named]
+
+- name: Configure DHCP subnet options
+  ansible.builtin.blockinfile:
+    path: /etc/dhcp/dhcpd.conf
+    insertafter: "^subnet {{ subnet_network }}"
+    marker: "# {mark} ANSIBLE MANAGED - DHCP subnet options"
+    block: |
+      option routers               {{ subnet_gateway }};
+      option domain-name           "{{ dns_domain }}";
+      option domain-search         "{{ dns_domain }}";
+      option domain-name-servers   {{ dhcp_dns_servers }};
+  register: _dhcp_subnet_options
+  tags: [foreman_dhcp]
+
+- name: Restart dhcpd to apply subnet options
+  ansible.builtin.service:
+    name: dhcpd
+    state: restarted
+  when: _dhcp_subnet_options is changed
+  tags: [foreman_dhcp]
+
+- name: Fix hammer SSL CA to trust custom certificate
+  ansible.builtin.lineinfile:
+    path: /etc/hammer/cli.modules.d/foreman.yml
+    regexp: '^\s*:ssl_ca_file:'
+    line: "  :ssl_ca_file: '{{ foreman_ssl_ca_dest }}'"
+  when: ca_chain.stdout | length > 0
+
+- name: Fix node.rb ENC SSL CA to trust custom certificate
+  ansible.builtin.lineinfile:
+    path: /etc/puppetlabs/puppet/foreman.yaml
+    regexp: '^\s*:ssl_ca:'
+    line: ":ssl_ca: \"{{ foreman_ssl_ca_dest }}\""
+  when: ca_chain.stdout | length > 0
+
+- name: Extract admin password from remote hammer config
+  ansible.builtin.shell:
+    cmd: |
+      python3 -c "
+      import re, sys
+      content = open('/root/.hammer/cli.modules.d/foreman.yml').read()
+      m = re.search(r\":password:\\s+'([^']+)'\", content)
+      if m:
+          print(m.group(1))
+      else:
+          sys.exit(1)
+      "
+  register: foreman_password_result
+  changed_when: false
+  failed_when: foreman_password_result.rc != 0
+
+- name: Set admin password fact
+  ansible.builtin.set_fact:
+    foreman_admin_password: "{{ foreman_password_result.stdout | trim }}"
+
+- name: Create local hammer config directory
+  ansible.builtin.file:
+    path: "{{ hammer_config_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Write local hammer config file
+  ansible.builtin.copy:
+    content: |
+      :foreman:
+        :enable_module: true
+        :host: 'https://{{ foreman_fqdn }}/'
+        :username: 'admin'
+        :password: '{{ foreman_admin_password }}'
+        :follow_redirects: always
+        :refresh_cache: false
+        :request_timeout: 120
+      :ssl:
+        :verify_ssl: false
+    dest: "{{ hammer_config_file }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false

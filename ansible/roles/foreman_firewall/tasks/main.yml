@@ -1,0 +1,133 @@
+---
+- name: Check if firewalld is active
+  ansible.builtin.command: systemctl is-active firewalld
+  register: firewalld_status
+  changed_when: false
+  failed_when: false
+
+- name: Check if iptables service is active
+  ansible.builtin.command: systemctl is-active iptables
+  register: iptables_status
+  changed_when: false
+  failed_when: false
+
+- name: Configure ports via firewalld
+  ansible.builtin.shell: |
+    set -e
+    changed=0
+    for port in {{ foreman_tcp_ports | join(' ') }}; do
+      if ! firewall-cmd --permanent --query-port="${port}/tcp" &>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/tcp"
+        changed=1
+      fi
+    done
+    for port in {{ foreman_udp_ports | join(' ') }}; do
+      if ! firewall-cmd --permanent --query-port="${port}/udp" &>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/udp"
+        changed=1
+      fi
+    done
+    if [ "$changed" = "1" ]; then
+      firewall-cmd --reload
+      echo "changed"
+    else
+      echo "unchanged"
+    fi
+  register: firewalld_result
+  changed_when: "'changed' in firewalld_result.stdout"
+  when: firewalld_status.rc == 0
+
+- name: Configure ports via iptables
+  ansible.builtin.shell: |
+    set -e
+    TCP_PORTS="{{ foreman_tcp_ports | join(' ') }}"
+    UDP_PORTS="{{ foreman_udp_ports | join(' ') }}"
+
+    # Return line number of first REJECT/DROP in INPUT, or empty string
+    reject_line() {
+      iptables -L INPUT --line-numbers -n 2>/dev/null \
+        | awk '/^[0-9]/ && /REJECT|DROP/ {print $1; exit}'
+    }
+
+    # Return line number of an ACCEPT rule for proto/port, or empty string
+    accept_line() {
+      local proto="$1" port="$2"
+      iptables -L INPUT --line-numbers -n 2>/dev/null \
+        | grep -E "^[0-9]" \
+        | grep " ACCEPT " \
+        | grep " ${proto} " \
+        | grep -E " dpt:${port}( |$)" \
+        | awk '{print $1}' | head -1
+    }
+
+    RLINE=$(reject_line)
+    RLINE=${RLINE:-0}
+
+    # Check if every ACCEPT rule exists AND sits before the REJECT line
+    needs_fix=0
+    for port in $TCP_PORTS; do
+      aline=$(accept_line tcp "$port")
+      aline=${aline:-0}
+      if [ "$aline" -eq 0 ] || { [ "$RLINE" -gt 0 ] && [ "$aline" -gt "$RLINE" ]; }; then
+        needs_fix=1; break
+      fi
+    done
+
+    if [ "$needs_fix" -eq 0 ]; then
+      for port in $UDP_PORTS; do
+        aline=$(accept_line udp "$port")
+        aline=${aline:-0}
+        if [ "$aline" -eq 0 ] || { [ "$RLINE" -gt 0 ] && [ "$aline" -gt "$RLINE" ]; }; then
+          needs_fix=1; break
+        fi
+      done
+    fi
+
+    if [ "$needs_fix" -eq 0 ]; then
+      echo "unchanged"
+      exit 0
+    fi
+
+    # Delete all our existing ACCEPT rules for these ports
+    for port in $TCP_PORTS; do
+      while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT
+      done
+    done
+    for port in $UDP_PORTS; do
+      while iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT
+      done
+    done
+
+    # Re-locate REJECT after deletions
+    RLINE=$(reject_line)
+    if [ -n "$RLINE" ] && [ "$RLINE" -gt 0 ]; then
+      POS="$RLINE"
+    else
+      LAST=$(iptables -L INPUT --line-numbers -n 2>/dev/null \
+             | awk '/^[0-9]/ {last=$1} END {print last+0}')
+      POS=$((${LAST:-0} + 1))
+    fi
+
+    # Insert each ACCEPT rule at POS (before REJECT); increment after each insert
+    # so subsequent rules land after the previously inserted one, all still before REJECT
+    for port in $TCP_PORTS; do
+      iptables -I INPUT "$POS" -p tcp --dport "$port" -j ACCEPT
+      POS=$((POS + 1))
+    done
+    for port in $UDP_PORTS; do
+      iptables -I INPUT "$POS" -p udp --dport "$port" -j ACCEPT
+      POS=$((POS + 1))
+    done
+
+    service iptables save
+    echo "changed"
+  register: iptables_result
+  changed_when: "'changed' in iptables_result.stdout"
+  when: firewalld_status.rc != 0 and iptables_status.rc == 0
+
+- name: Warn if no supported firewall is active
+  ansible.builtin.debug:
+    msg: "WARNING: neither firewalld nor iptables service is active. Firewall ports were not configured."
+  when: firewalld_status.rc != 0 and iptables_status.rc != 0

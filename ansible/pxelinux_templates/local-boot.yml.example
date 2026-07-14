@@ -1,0 +1,16 @@
+# Set the "Local boot PXELinux template" global setting in Foreman
+# (Administer → Settings → Provisioning → Local boot PXELinux template).
+# Copy this file to local-boot.yml and set the template name.
+#
+# The template must already exist in Foreman — either a built-in template or
+# a custom template uploaded from this directory. The task verifies the template
+# exists with kind PXELinux before applying the setting, and prints a warning
+# (without failing) if the named template is not found.
+#
+# Run on the Foreman host to see the current value:
+#   hammer settings list --search "local_boot"
+#
+# Run on the Foreman host to list available PXELinux templates:
+#   hammer template list --per-page 100 | grep PXELinux
+
+template: "PXELinux default local boot"

@@ -1,0 +1,130 @@
+---
+- name: Find ISO files in /mnt/iso
+  ansible.builtin.find:
+    paths: /mnt/iso
+    patterns: "*.iso"
+    recurse: false
+  register: iso_find_result
+
+- name: Parse ISO filenames and derive mount points
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import re, json, os, sys
+
+    iso_files = {{ iso_find_result.files | map(attribute='path') | list | to_json }}
+
+    def parse_iso(path):
+        fname = os.path.basename(path)
+        name = os.path.splitext(fname)[0]
+
+        # Rocky Linux: Rocky-9.1-x86_64-dvd  Rocky-9.1-x86_64-minimal
+        m = re.match(r'^Rocky-(\d+\.\d+)-([^-]+)-', name, re.IGNORECASE)
+        if m:
+            return {'iso': path, 'mount': '/srv/distro/Rocky/{}/{}'.format(m.group(1), m.group(2))}
+
+        # RHEL CDN: RHEL-9.4.0-20240501.0-x86_64-dvd1  RHEL-10.0-20250410.6-x86_64-dvd1
+        # 8-digit date stamp after version distinguishes CDN from simple format
+        m = re.match(r'^RHEL-(\d+\.\d+)(?:\.\d+)?-\d{8}\.\d+-([a-zA-Z0-9_]+)-', name, re.IGNORECASE)
+        if m:
+            return {'iso': path, 'mount': '/srv/distro/RHEL/{}/{}'.format(m.group(1), m.group(2))}
+
+        # RHEL simple: rhel-9.1-x86_64-dvd (arch follows directly after version)
+        m = re.match(r'^RHEL-(\d+\.\d+)(?:\.\d+)?-([a-zA-Z][^-]*)-', name, re.IGNORECASE)
+        if m:
+            return {'iso': path, 'mount': '/srv/distro/RHEL/{}/{}'.format(m.group(1), m.group(2))}
+
+        # Fedora variant-type-arch-version: Fedora-Server-dvd-x86_64-40
+        m = re.match(r'^Fedora-[^-]+-[^-]+-([^-]+)-(\d+)', name, re.IGNORECASE)
+        if m:
+            arch, version = m.group(1), m.group(2)
+            return {'iso': path, 'mount': '/srv/distro/Fedora/{}/{}'.format(version, arch)}
+
+        # Fedora version-arch-variant: Fedora-40-x86_64-dvd
+        m = re.match(r'^Fedora-(\d+)-([^-]+)-', name, re.IGNORECASE)
+        if m:
+            version, arch = m.group(1), m.group(2)
+            return {'iso': path, 'mount': '/srv/distro/Fedora/{}/{}'.format(version, arch)}
+
+        sys.stderr.write('WARNING: unrecognised ISO filename, skipping: {}\n'.format(fname))
+        return None
+
+    seen = set()
+    result = []
+    for path in sorted(iso_files):
+        parsed = parse_iso(path)
+        if parsed and parsed['mount'] not in seen:
+            seen.add(parsed['mount'])
+            result.append(parsed)
+
+    print(json.dumps(result))
+    PYEOF
+  register: iso_parse_result
+  changed_when: false
+  when: iso_find_result.files | length > 0
+
+- name: Set ISO mount list fact (ISOs found)
+  ansible.builtin.set_fact:
+    iso_mounts: "{{ iso_parse_result.stdout | from_json }}"
+  when: iso_find_result.files | length > 0
+
+- name: Set ISO mount list fact (no ISOs found)
+  ansible.builtin.set_fact:
+    iso_mounts: []
+  when: iso_find_result.files | length == 0
+
+- name: Create distro mount point directories
+  ansible.builtin.file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  loop: "{{ iso_mounts }}"
+
+- name: Mount ISOs and add /etc/fstab entries
+  ansible.posix.mount:
+    path: "{{ item.mount }}"
+    src: "{{ item.iso }}"
+    fstype: iso9660
+    opts: ro,loop
+    state: mounted
+  loop: "{{ iso_mounts }}"
+
+- name: Enable mod_alias for httpd (not loaded in Foreman's stripped httpd config)
+  ansible.builtin.copy:
+    dest: /etc/httpd/conf.modules.d/alias.load
+    mode: "0644"
+    content: "LoadModule alias_module modules/mod_alias.so\n"
+  notify: Reload httpd
+
+- name: Enable mod_autoindex for httpd (required for directory listings)
+  ansible.builtin.copy:
+    dest: /etc/httpd/conf.modules.d/autoindex.load
+    mode: "0644"
+    content: "LoadModule autoindex_module modules/mod_autoindex.so\n"
+  notify: Reload httpd
+
+- name: Enable mod_dir for httpd (redirects /distro to /distro/ so relative links resolve correctly)
+  ansible.builtin.copy:
+    dest: /etc/httpd/conf.modules.d/dir.load
+    mode: "0644"
+    content: "LoadModule dir_module modules/mod_dir.so\n"
+  notify: Reload httpd
+
+- name: Configure httpd distro virtual host on port 8080
+  ansible.builtin.copy:
+    dest: /etc/httpd/conf.d/distro.conf
+    mode: "0644"
+    content: |
+      Listen 0.0.0.0:8080
+      <VirtualHost *:8080>
+
+      Alias /distro /srv/distro
+
+      <Directory /srv/distro>
+        AllowOverride Options FileInfo
+        Options +Indexes +FollowSymLinks
+      </Directory>
+
+      </VirtualHost>
+  notify: Reload httpd
