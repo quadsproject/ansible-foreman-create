@@ -22,8 +22,12 @@
 - name: Install Python packages required by theforeman.foreman collection
   ansible.builtin.dnf:
     name:
-      - python3-apypie
       - python3-pyyaml
+    state: present
+
+- name: Install apypie via pip (no RPM available in Foreman 3.x repos for EL9)
+  ansible.builtin.pip:
+    name: apypie
     state: present
 
 - name: Wait for Foreman API to become ready
@@ -49,6 +53,15 @@
     validate_certs: "{{ foreman_validate_certs }}"
     name: safemode_render
     value: false
+
+- name: Disable Puppet out-of-sync host warnings (Config Management > Puppet out of sync disabled)
+  theforeman.foreman.setting:
+    server_url: "{{ foreman_url }}"
+    username: "{{ foreman_admin_username }}"
+    password: "{{ foreman_admin_password }}"
+    validate_certs: "{{ foreman_validate_certs }}"
+    name: puppet_out_of_sync_disabled
+    value: true
 
 # --- Domain and subnet ---
 
