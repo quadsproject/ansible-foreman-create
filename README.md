@@ -27,16 +27,14 @@ constraint ever changes.
 
 ### Remote packages (installed by Ansible on the Foreman host)
 
-The `foreman_configure` role installs these on the Foreman host via `dnf`
-during the playbook run. They are only needed while the playbook is
-running — Foreman itself (a Ruby on Rails application) does not use them
-at runtime. `python3-apypie` comes from the Foreman repository added by
-the install role; `python3-pyyaml` comes from the standard Rocky 9 repos.
+The `foreman_configure` role installs these on the Foreman host during the
+playbook run. They are only needed while the playbook is running — Foreman
+itself (a Ruby on Rails application) does not use them at runtime.
 
-| RPM package | Why |
-|-------------|-----|
-| `python3-apypie` | HTTP client used by all `theforeman.foreman` collection modules |
-| `python3-pyyaml` | Required by `theforeman.foreman.partition_table` and other collection modules |
+| Package | Installed via | Why |
+|---------|---------------|-----|
+| `apypie` | `pip` (PyPI) | HTTP client used by all `theforeman.foreman` collection modules; no RPM available in Foreman 3.x repos for EL9 |
+| `python3-pyyaml` | `dnf` (standard Rocky 9 repos) | Required by `theforeman.foreman.partition_table` and other collection modules |
 
 ### Ansible collections
 
@@ -223,6 +221,27 @@ print(json.dumps(d))
 PYEOF
 )
 ```
+
+### Quick cheat sheet
+
+All commands below assume `/tmp/foreman_inv.ini` and `$EVARS` are set as described above.
+
+```bash
+venv/bin/ansible-playbook -i /tmp/foreman_inv.ini ansible/site.yml [--tags <tag>] --extra-vars "$EVARS"
+```
+
+| Tag | Scope |
+|-----|-------|
+| _(none)_ | Full install: runs all four roles in order (firewall, install, distro, configure) |
+| `foreman_firewall` | Open required ports in iptables; reorder rules if needed |
+| `foreman_install` | Full Foreman installation: hostname, SSL, sysctl, foreman-installer, named, DHCP, hammer config |
+| `foreman_distro` | Scan `/mnt/iso`, mount ISOs under `/srv/distro`, write Apache distro config |
+| `foreman_configure` | Domain, subnet, OS entries, templates, partition tables, hostgroups, global settings |
+| `foreman_sysctl` | Kernel sysctl parameters only (subset of `foreman_install`) |
+| `foreman_named` | named/DNS options only (subset of `foreman_install`) |
+| `foreman_dhcp` | DHCP subnet options only (subset of `foreman_install`) |
+
+---
 
 ### Check and correct firewall rules
 
