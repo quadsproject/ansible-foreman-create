@@ -47,6 +47,31 @@ def _validate_file(path, label):
         _abort(f"{label} '{path}' does not exist or is not a file")
 
 
+def _create_self_signed_cert(fqdn):
+    cert_path = f"/tmp/{fqdn}.crt"
+    key_path = f"/tmp/{fqdn}.key"
+    print(f"Generating self-signed certificate for {fqdn} ...")
+    result = subprocess.run(
+        [
+            "openssl", "req", "-x509",
+            "-newkey", "rsa:4096",
+            "-keyout", key_path,
+            "-out", cert_path,
+            "-days", "3650",
+            "-nodes",
+            "-subj", f"/CN={fqdn}",
+            "-addext", f"subjectAltName=DNS:{fqdn}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        _abort(f"openssl failed: {result.stderr.strip()}")
+    print(f"  Certificate: {cert_path}")
+    print(f"  Key:         {key_path}")
+    return cert_path, key_path
+
+
 def _check_ssh(host):
     print(f"Verifying passwordless SSH to root@{host} ...")
     result = subprocess.run(
@@ -264,15 +289,31 @@ def main():
     if not dhcp_interface:
         _abort("DHCP interface is required")
 
-    ssl_cert = args.ssl_cert or _prompt("Path to SSL certificate file")
-    if not ssl_cert:
-        _abort("SSL certificate path is required")
-    _validate_file(ssl_cert, "SSL certificate")
-
-    ssl_key = args.ssl_key or _prompt("Path to SSL private key file")
-    if not ssl_key:
-        _abort("SSL key path is required")
-    _validate_file(ssl_key, "SSL key")
+    if not args.ssl_cert and not args.ssl_key:
+        answer = _prompt(
+            f"Create a self-signed certificate for {foreman_fqdn}? (yes/no)",
+            default="yes",
+        )
+        if answer.strip().lower() in ("yes", "y"):
+            ssl_cert, ssl_key = _create_self_signed_cert(foreman_fqdn)
+        else:
+            ssl_cert = _prompt("Path to SSL certificate file")
+            if not ssl_cert:
+                _abort("SSL certificate path is required")
+            _validate_file(ssl_cert, "SSL certificate")
+            ssl_key = _prompt("Path to SSL private key file")
+            if not ssl_key:
+                _abort("SSL key path is required")
+            _validate_file(ssl_key, "SSL key")
+    else:
+        ssl_cert = args.ssl_cert or _prompt("Path to SSL certificate file")
+        if not ssl_cert:
+            _abort("SSL certificate path is required")
+        _validate_file(ssl_cert, "SSL certificate")
+        ssl_key = args.ssl_key or _prompt("Path to SSL private key file")
+        if not ssl_key:
+            _abort("SSL key path is required")
+        _validate_file(ssl_key, "SSL key")
 
     upstream_dns_raw = args.upstream_dns or _prompt(
         "Upstream DNS forwarder IPs (comma-separated, e.g. 8.8.8.8,1.1.1.1)"
