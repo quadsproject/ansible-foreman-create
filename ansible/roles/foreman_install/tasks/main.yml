@@ -377,3 +377,54 @@
     mode: "0600"
   delegate_to: localhost
   become: false
+
+# --- Switch host resolver to its own DNS ---
+
+- name: Verify Foreman named resolves own FQDN and external names
+  ansible.builtin.shell: |
+    set -e
+    fail=0
+    check() {
+      local label=$1 name=$2
+      result=$(dig +short +timeout=5 +tries=2 "@{{ dhcp_interface_ip }}" "$name" 2>/dev/null)
+      if echo "$result" | grep -qE '^[0-9]+\.'; then
+        echo "OK: $label ($name) -> $(echo "$result" | head -1)"
+      else
+        echo "FAIL: $label ($name) returned: ${result:-<empty>}"
+        fail=1
+      fi
+    }
+    check "own FQDN"               "{{ foreman_fqdn }}"
+    check "external (redhat.com)"  "redhat.com"
+    check "external (rockylinux.org)" "rockylinux.org"
+    [ "$fail" -eq 0 ] || exit 1
+  register: _dns_verify
+  changed_when: false
+
+- name: Show DNS verification results
+  ansible.builtin.debug:
+    msg: "{{ _dns_verify.stdout_lines }}"
+
+- name: Configure host to use its own DNS server
+  ansible.builtin.shell: |
+    CHANGED=0
+    while read -r conn; do
+      iface=$(nmcli -t -f GENERAL.DEVICE conn show "$conn" 2>/dev/null | cut -d: -f2 | head -1)
+      [ "$iface" = "lo" ] && continue
+      [ "$iface" = "{{ dhcp_interface }}" ] && continue
+      [ -z "$iface" ] && continue
+      curr_dns=$(nmcli -g ipv4.dns conn show "$conn" 2>/dev/null | head -1)
+      curr_ignore=$(nmcli -g ipv4.ignore-auto-dns conn show "$conn" 2>/dev/null | head -1)
+      if [ "$curr_dns" != "{{ dhcp_interface_ip }}" ] || [ "$curr_ignore" != "yes" ]; then
+        nmcli conn modify "$conn" \
+          ipv4.dns "{{ dhcp_interface_ip }}" \
+          ipv4.dns-search "{{ dns_domain }}" \
+          ipv4.ignore-auto-dns yes
+        nmcli device reapply "$iface" 2>/dev/null || true
+        CHANGED=1
+        echo "Updated: connection '$conn' (device $iface)"
+      fi
+    done < <(nmcli -t -f NAME conn show --active)
+    [ "$CHANGED" = "1" ] && echo "changed" || echo "unchanged"
+  register: _dns_resolver
+  changed_when: "'changed' in _dns_resolver.stdout"
