@@ -128,6 +128,8 @@
     certs = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', content, re.DOTALL)
     if len(certs) > 1:
         print('\n'.join(certs[1:]))
+    elif len(certs) == 1:
+        print(certs[0])
     "
   register: ca_chain
   changed_when: false
