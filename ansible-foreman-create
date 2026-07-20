@@ -390,9 +390,25 @@ def main():
     else:
         secondary_dns = ""
 
-    # DHCP range: start one after the Foreman host IP, end one before the gateway.
-    dhcp_range_start = str(foreman_ip + 1)
-    dhcp_range_end = str(gateway_ip - 1)
+    # DHCP range: if the gateway is at or below the Foreman host IP (i.e. at the
+    # low end of the block), extend the range to the last usable address.
+    # Otherwise the range sits between the Foreman host and the gateway.
+    if gateway_ip <= foreman_ip:
+        _dhcp_start = foreman_ip + 1
+        _dhcp_end = network.broadcast_address - 1
+    else:
+        _dhcp_start = foreman_ip + 1
+        _dhcp_end = gateway_ip - 1
+
+    if _dhcp_start > _dhcp_end:
+        _abort(
+            f"DHCP range is invalid: start ({_dhcp_start}) > end ({_dhcp_end}). "
+            f"The subnet ({subnet}) does not leave room for a DHCP range given "
+            f"Foreman host IP {foreman_ip} and gateway {gateway_ip}."
+        )
+
+    dhcp_range_start = str(_dhcp_start)
+    dhcp_range_end = str(_dhcp_end)
 
     # DNS servers for DHCP option 6 (domain-name-servers).
     dhcp_dns_parts = [primary_dns]
