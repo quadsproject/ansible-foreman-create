@@ -23,6 +23,7 @@
   ansible.builtin.dnf:
     name:
       - python3-pyyaml
+      - python3-pip
     state: present
 
 - name: Install apypie via pip (no RPM available in Foreman 3.x repos for EL9)
