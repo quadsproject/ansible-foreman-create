@@ -43,83 +43,32 @@
     TCP_PORTS="{{ foreman_tcp_ports | join(' ') }}"
     UDP_PORTS="{{ foreman_udp_ports | join(' ') }}"
 
-    # Return line number of first REJECT/DROP in INPUT, or empty string
-    reject_line() {
-      iptables -L INPUT --line-numbers -n 2>/dev/null \
-        | awk '/^[0-9]/ && /REJECT|DROP/ {print $1; exit}'
-    }
-
-    # Return line number of an ACCEPT rule for proto/port, or empty string
-    accept_line() {
-      local proto="$1" port="$2"
-      iptables -L INPUT --line-numbers -n 2>/dev/null \
-        | grep -E "^[0-9]" \
-        | grep " ACCEPT " \
-        | grep " ${proto} " \
-        | grep -E " dpt:${port}( |$)" \
-        | awk '{print $1}' | head -1
-    }
-
-    RLINE=$(reject_line)
-    RLINE=${RLINE:-0}
-
-    # Check if every ACCEPT rule exists AND sits before the REJECT line
-    needs_fix=0
-    for port in $TCP_PORTS; do
-      aline=$(accept_line tcp "$port")
-      aline=${aline:-0}
-      if [ "$aline" -eq 0 ] || { [ "$RLINE" -gt 0 ] && [ "$aline" -gt "$RLINE" ]; }; then
-        needs_fix=1; break
-      fi
-    done
-
-    if [ "$needs_fix" -eq 0 ]; then
-      for port in $UDP_PORTS; do
-        aline=$(accept_line udp "$port")
-        aline=${aline:-0}
-        if [ "$aline" -eq 0 ] || { [ "$RLINE" -gt 0 ] && [ "$aline" -gt "$RLINE" ]; }; then
-          needs_fix=1; break
-        fi
+    # Emit the complete desired INPUT ruleset in iptables-save (-S) format.
+    expected_rules() {
+      echo "-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT"
+      echo "-A INPUT -p icmp -j ACCEPT"
+      echo "-A INPUT -i lo -j ACCEPT"
+      echo "-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT"
+      for port in $TCP_PORTS; do
+        echo "-A INPUT -p tcp -m state --state NEW -m tcp --dport ${port} -j ACCEPT"
       done
-    fi
+      for port in $UDP_PORTS; do
+        echo "-A INPUT -p udp -m udp --dport ${port} -j ACCEPT"
+      done
+      echo "-A INPUT -j REJECT --reject-with icmp-host-prohibited"
+    }
 
-    if [ "$needs_fix" -eq 0 ]; then
+    current=$(iptables -S INPUT | grep -v '^-P ')
+
+    if [ "$(expected_rules)" = "$current" ]; then
       echo "unchanged"
       exit 0
     fi
 
-    # Delete all our existing ACCEPT rules for these ports
-    for port in $TCP_PORTS; do
-      while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
-        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT
-      done
-    done
-    for port in $UDP_PORTS; do
-      while iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do
-        iptables -D INPUT -p udp --dport "$port" -j ACCEPT
-      done
-    done
-
-    # Re-locate REJECT after deletions
-    RLINE=$(reject_line)
-    if [ -n "$RLINE" ] && [ "$RLINE" -gt 0 ]; then
-      POS="$RLINE"
-    else
-      LAST=$(iptables -L INPUT --line-numbers -n 2>/dev/null \
-             | awk '/^[0-9]/ {last=$1} END {print last+0}')
-      POS=$((${LAST:-0} + 1))
-    fi
-
-    # Insert each ACCEPT rule at POS (before REJECT); increment after each insert
-    # so subsequent rules land after the previously inserted one, all still before REJECT
-    for port in $TCP_PORTS; do
-      iptables -I INPUT "$POS" -p tcp --dport "$port" -j ACCEPT
-      POS=$((POS + 1))
-    done
-    for port in $UDP_PORTS; do
-      iptables -I INPUT "$POS" -p udp --dport "$port" -j ACCEPT
-      POS=$((POS + 1))
-    done
+    iptables -F INPUT
+    while IFS= read -r rule; do
+      iptables $rule
+    done < <(expected_rules)
 
     service iptables save
     echo "changed"
