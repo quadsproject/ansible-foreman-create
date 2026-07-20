@@ -80,3 +80,21 @@
   ansible.builtin.debug:
     msg: "WARNING: neither firewalld nor iptables service is active. Firewall ports were not configured."
   when: firewalld_status.rc != 0 and iptables_status.rc != 0
+
+- name: Add SNAT rule for TFTP TID packets on managed interface
+  ansible.builtin.shell: |
+    # in.tftpd binds its TID socket to the host's primary IP regardless of which
+    # interface received the RRQ. SNAT on the PXE interface rewrites the TID source
+    # to {{ dhcp_interface_ip }} so PXE clients see the expected server address in
+    # DATA packets; nf_conntrack_tftp handles the reverse DNAT for ACK packets.
+    RULE="-o {{ dhcp_interface }} -m conntrack --ctstate RELATED -p udp -j SNAT --to-source {{ dhcp_interface_ip }}"
+    if iptables -t nat -C POSTROUTING $RULE 2>/dev/null; then
+      echo "unchanged"
+    else
+      iptables -t nat -A POSTROUTING $RULE
+      service iptables save
+      echo "changed"
+    fi
+  register: _tftp_snat
+  changed_when: "'changed' in _tftp_snat.stdout"
+  when: firewalld_status.rc != 0 and iptables_status.rc == 0

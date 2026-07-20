@@ -36,6 +36,10 @@
     policy: targeted
     state: permissive
 
+- name: Ensure nf_conntrack_tftp is loaded (required for TFTP TID tracking through iptables)
+  ansible.builtin.command: modprobe nf_conntrack_tftp
+  changed_when: false
+
 - name: Wait for Foreman API to become ready
   ansible.builtin.uri:
     url: "{{ foreman_url }}/api/v2/status"

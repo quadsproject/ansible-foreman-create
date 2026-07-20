@@ -197,38 +197,47 @@
   register: foreman_installer_result
   changed_when: "'Installation complete' in foreman_installer_result.stdout"
 
-- name: Ensure tftp.socket drop-in directory exists
-  ansible.builtin.file:
-    path: /etc/systemd/system/tftp.socket.d
-    state: directory
-    mode: "0755"
+- name: Disable and stop tftp.socket (replaced by standalone foreman-tftpd.service)
+  ansible.builtin.service:
+    name: tftp.socket
+    state: stopped
+    enabled: false
+  failed_when: false
 
-- name: Force in.tftpd to use IPv4 socket (fixes source-IP mismatch on multi-homed hosts)
+- name: Deploy standalone foreman-tftpd.service unit
   ansible.builtin.copy:
-    dest: /etc/systemd/system/tftp.socket.d/ipv4-override.conf
+    dest: /etc/systemd/system/foreman-tftpd.service
     mode: "0644"
     content: |
-      [Socket]
-      ListenDatagram=
-      ListenDatagram=0.0.0.0:69
-  register: _tftp_socket_override
+      [Unit]
+      Description=Foreman TFTP Server (standalone IPv4)
+      After=network.target
 
-- name: Force in.tftpd to IPv4-only mode in service override
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/tftp.service.d/tftp-service-override.conf
-    mode: "0644"
-    content: |
       [Service]
-      ExecStart=
-      ExecStart=/usr/sbin/in.tftpd --ipv4 --secure /var/lib/tftpboot
-  register: _tftp_service_override
+      ExecStart=/usr/sbin/in.tftpd --foreground --listen --ipv4 --address 0.0.0.0:69 --secure /var/lib/tftpboot
+      Restart=on-failure
+      RestartSec=5
 
-- name: Reload systemd and restart tftp socket to apply IPv4 override
-  ansible.builtin.shell: |
-    systemctl daemon-reload
-    systemctl restart tftp.socket
-  when: _tftp_socket_override is changed or _tftp_service_override is changed
-  changed_when: true
+      [Install]
+      WantedBy=multi-user.target
+  register: _foreman_tftpd_unit
+
+- name: Enable and start foreman-tftpd.service
+  ansible.builtin.systemd:
+    name: foreman-tftpd.service
+    state: "{{ 'restarted' if _foreman_tftpd_unit is changed else 'started' }}"
+    enabled: true
+    daemon_reload: true
+
+- name: Persist nf_conntrack_tftp kernel module across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/tftp-conntrack.conf
+    mode: "0644"
+    content: "nf_conntrack_tftp\n"
+
+- name: Load nf_conntrack_tftp kernel module now
+  ansible.builtin.command: modprobe nf_conntrack_tftp
+  changed_when: false
 
 - name: Disable cobbler SELinux module to prevent mislabeling of TFTP files
   ansible.builtin.shell: |
