@@ -197,6 +197,56 @@
   register: foreman_installer_result
   changed_when: "'Installation complete' in foreman_installer_result.stdout"
 
+- name: Ensure tftp.socket drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/tftp.socket.d
+    state: directory
+    mode: "0755"
+
+- name: Force in.tftpd to use IPv4 socket (fixes source-IP mismatch on multi-homed hosts)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tftp.socket.d/ipv4-override.conf
+    mode: "0644"
+    content: |
+      [Socket]
+      ListenDatagram=
+      ListenDatagram=0.0.0.0:69
+  register: _tftp_socket_override
+
+- name: Force in.tftpd to IPv4-only mode in service override
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tftp.service.d/tftp-service-override.conf
+    mode: "0644"
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/usr/sbin/in.tftpd --ipv4 --secure /var/lib/tftpboot
+  register: _tftp_service_override
+
+- name: Reload systemd and restart tftp socket to apply IPv4 override
+  ansible.builtin.shell: |
+    systemctl daemon-reload
+    systemctl restart tftp.socket
+  when: _tftp_socket_override is changed or _tftp_service_override is changed
+  changed_when: true
+
+- name: Disable cobbler SELinux module to prevent mislabeling of TFTP files
+  ansible.builtin.shell: |
+    if semodule -l 2>/dev/null | grep -q '^cobbler\b'; then
+      semodule -d cobbler
+      echo "changed"
+    else
+      echo "unchanged"
+    fi
+  register: _cobbler_semodule
+  changed_when: "'changed' in _cobbler_semodule.stdout"
+
+- name: Restore SELinux contexts on TFTP root after disabling cobbler module
+  ansible.builtin.command: restorecon -Rv /var/lib/tftpboot/
+  register: _restorecon_tftp
+  changed_when: _restorecon_tftp.stdout | length > 0
+  when: _cobbler_semodule is changed
+
 - name: Remove stray dnssec-enable line from outside the managed block
   ansible.builtin.lineinfile:
     path: /etc/named/options.conf
