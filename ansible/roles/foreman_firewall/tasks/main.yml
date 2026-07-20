@@ -83,10 +83,6 @@
 
 - name: Add SNAT rule for TFTP TID packets on managed interface
   ansible.builtin.shell: |
-    # in.tftpd binds its TID socket to the host's primary IP regardless of which
-    # interface received the RRQ. SNAT on the PXE interface rewrites the TID source
-    # to {{ dhcp_interface_ip }} so PXE clients see the expected server address in
-    # DATA packets; nf_conntrack_tftp handles the reverse DNAT for ACK packets.
     RULE="-o {{ dhcp_interface }} -m conntrack --ctstate RELATED -p udp -j SNAT --to-source {{ dhcp_interface_ip }}"
     if iptables -t nat -C POSTROUTING $RULE 2>/dev/null; then
       echo "unchanged"
