@@ -31,6 +31,11 @@
     name: apypie
     state: present
 
+- name: Set SELinux to permissive mode
+  ansible.posix.selinux:
+    policy: targeted
+    state: permissive
+
 - name: Wait for Foreman API to become ready
   ansible.builtin.uri:
     url: "{{ foreman_url }}/api/v2/status"
