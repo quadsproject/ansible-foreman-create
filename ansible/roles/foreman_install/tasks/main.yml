@@ -194,6 +194,8 @@
       - "true"
       - --foreman-proxy-tftp-managed
       - "true"
+      - --foreman-proxy-tftp-servername
+      - "{{ dhcp_interface_ip }}"
   register: foreman_installer_result
   changed_when: "'Installation complete' in foreman_installer_result.stdout"
 
