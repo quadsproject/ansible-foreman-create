@@ -58,7 +58,7 @@
       echo "-A INPUT -j REJECT --reject-with icmp-host-prohibited"
     }
 
-    current=$(iptables -S INPUT | grep -v '^-P ')
+    current=$(iptables -S INPUT | grep -v '^-P ' || true)
 
     if [ "$(expected_rules)" = "$current" ]; then
       echo "unchanged"
