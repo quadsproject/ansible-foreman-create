@@ -11,14 +11,14 @@ The `venv/` directory is not portable — recreate it on the control node:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install ansible-core==2.21.1 PyYAML
+pip install ansible-core PyYAML
 ```
 
 ### Local pip packages
 
 | Package | Why |
 |---------|-----|
-| `ansible-core==2.21.1` | Ansible engine and all `ansible.builtin` modules |
+| `ansible-core` | Ansible engine and all `ansible.builtin` modules |
 | `PyYAML` | Required by `ansible-core` internally; also used by local Jinja2 `\| from_yaml` filters |
 
 Note: `ansible-core` declares `PyYAML` as a dependency and will pull it in
